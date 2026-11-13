@@ -1,0 +1,30 @@
+{
+  "name": "gatekeeperapp",
+  "version": "1.0.0",
+  "description": "Multi-unit gate entry/exit app: guard requests, admin approves, live notifications",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.js",
+    "test": "node --disable-warning=ExperimentalWarning test/smoke.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/abrai2134/gatekeeperapp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/abrai2134/gatekeeperapp/issues"
+  },
+  "homepage": "https://github.com/abrai2134/gatekeeperapp#readme",
+  "dependencies": {
+    "express": "^4.22.3",
+    "socket.io": "^4.8.4",
+    "web-push": "^3.6.7"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=22.5"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.4"
+  }
+}
