@@ -1,0 +1,58 @@
+name: Build Android app
+
+on:
+  push:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Use the app signing key (keeps updates installable)
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "KEYSTORE_PASSWORD=gatekeeper-release" >> "$GITHUB_ENV"
+            echo "KEY_ALIAS=gatekeeper" >> "$GITHUB_ENV"
+          else
+            echo "::warning::ANDROID_KEYSTORE_B64 secret is not set – using a temporary key. Phones must uninstall before installing the next build."
+          fi
+
+      - name: Build APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleRelease -PversionCode=${{ github.run_number }} ${{ vars.SERVER_URL && format('-PserverUrl={0}', vars.SERVER_URL) || '' }}
+          cp app/build/outputs/apk/release/app-release.apk "$RUNNER_TEMP/gatekeeper.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gatekeeper-apk
+          path: ${{ runner.temp }}/gatekeeper.apk
+
+      - name: Publish download (latest release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "android-v1.0.${{ github.run_number }}" "$RUNNER_TEMP/gatekeeper.apk" \
+            --repo "${{ github.repository }}" --target "${{ github.sha }}" --latest \
+            --title "Gatekeeper Android app 1.0.${{ github.run_number }}" \
+            --notes "Install on Android phones: download gatekeeper.apk below, open it, allow 'Install unknown apps'. Built from ${{ github.ref_name }} @ ${{ github.sha }}."

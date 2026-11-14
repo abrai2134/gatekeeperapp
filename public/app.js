@@ -20,6 +20,19 @@ const S = {
 
 // ------------------------------------------------------------ utils
 const $ = (sel, root = document) => root.querySelector(sel);
+// Set when running inside the Gatekeeper Android app (full-screen alerts come from the phone app)
+const Native = window.GatekeeperAndroid && window.GatekeeperAndroid.isApp ? window.GatekeeperAndroid : null;
+function nativeStatus() {
+  if (!Native) return null;
+  try { return JSON.parse(Native.alertStatus()); } catch { return null; }
+}
+const NATIVE_STEPS = [
+  ['registered', 'Phone connected to server for alerts', null],
+  ['notifications', 'Notifications allowed (set to Alert / Pop on screen)', 'notifications'],
+  ['fullScreen', 'Full-screen alerts allowed (shows on lock screen)', 'fullscreen'],
+  ['overlay', 'Display over other apps (popup while phone is in use)', 'overlay'],
+  ['battery', 'Battery: not optimised (alerts while phone sleeps)', 'battery'],
+];
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const isAdmin = () => S.user?.role === 'admin';
 const isSuper = () => isAdmin() && S.user.unit_id == null;
@@ -90,7 +103,7 @@ function vibrate(p) { try { navigator.vibrate?.(p); } catch { /* ignore */ } }
 
 // local notification when the tab is in the background and push is not set up
 async function localNotify(title, body, tag) {
-  if (S.pushOn || !document.hidden || Notification?.permission !== 'granted') return;
+  if (S.pushOn || !document.hidden || typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
   const reg = await navigator.serviceWorker?.getRegistration();
   if (reg) reg.showNotification(title, { body, tag, icon: '/icon.svg', renotify: true });
   else new Notification(title, { body, tag });
@@ -119,8 +132,11 @@ async function checkPush() {
 async function testPush(btn) {
   btn && (btn.disabled = true);
   try {
-    if (!S.pushOn) await enablePush();
-    const r = await api('/api/push/test', { body: {} });
+    if (Native) {
+      Native.retryRegister();
+      toast('🔒 Lock the phone now – the test alert comes in 5 seconds', 'ok');
+    } else if (!S.pushOn) await enablePush();
+    const r = await api('/api/push/test', { body: { delay: Native ? 5 : 0 } });
     if (!r.devices) toast('No phone/browser is registered for your login. Tap Enable first.', 'err');
     else if (!r.delivered) toast('Sending failed. Tap Enable again, then retry.', 'err');
     else toast(`Test sent to ${r.delivered} device(s). Lock the phone – it should pop up within seconds.`, 'ok');
@@ -154,6 +170,13 @@ async function login(username, password) {
   await start();
 }
 async function logout(silent) {
+  if (Native) {
+    try {
+      const t = Native.getFcmToken();
+      if (t && S.token && !silent) await api('/api/push/fcm/remove', { body: { token: t } });
+    } catch { /* ignore */ }
+    Native.clearSession();
+  }
   if (!silent && S.token) {
     try {
       const reg = await navigator.serviceWorker?.getRegistration();
@@ -170,6 +193,7 @@ async function logout(silent) {
 }
 
 async function start() {
+  if (Native) { try { Native.setSession(S.token, JSON.stringify(S.user)); } catch { /* ignore */ } }
   S.tab = isAdmin() ? 'requests' : 'new';
   S.units = await api('/api/units');
   connectSocket();
@@ -246,6 +270,7 @@ async function catchUp() {
   } catch { /* offline – try again later */ } finally { catchingUp = false; }
   render();
 }
+window.gkCatchUp = () => { catchUp(); };
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { catchUp(); checkPush().then(render); } });
 window.addEventListener('online', catchUp);
 setInterval(() => { if (!document.hidden) catchUp(); }, 60000);
@@ -467,6 +492,13 @@ function statsHTML() {
   </div>`;
 }
 function pushBanner() {
+  if (Native) {
+    const st = nativeStatus();
+    const missing = st ? NATIVE_STEPS.filter(([k]) => !st[k]).length : 0;
+    if (!missing) return '';
+    return `<div class="banner" style="background:#fef3c7;border-color:#fcd34d;color:#78350f"><span class="grow">⚠️ Full-screen alerts are not fully set up on this phone (${missing} step${missing > 1 ? 's' : ''} left).</span>
+      <button class="btn primary sm" data-action="tab" data-tab="account">Fix now</button></div>`;
+  }
   if (S.pushOn || !pushSupported() || localStorage.getItem('gk_push_dismiss') === '1') return '';
   return `<div class="banner"><span class="grow">🔔 Turn on notifications so you get ${isAdmin() ? 'entry requests' : 'approvals'} even when the app is closed.</span>
     <button class="btn primary sm" data-action="enable-push">Enable</button>
@@ -733,7 +765,39 @@ function usersHTML() {
   <p class="muted small">Tip: admins with a unit selected can only see and approve that unit. "All units" admin is the main admin.</p>`;
 }
 
+function nativeAlertsHTML() {
+  const st = nativeStatus() || {};
+  const brand = String(st.brand || '').toLowerCase();
+  const oemTip = /xiaomi|redmi|poco/.test(brand)
+    ? 'Xiaomi/Redmi: App info → Other permissions → allow <b>Show on lock screen</b> and <b>Display pop-up windows while running in background</b>; also turn <b>Autostart</b> ON.'
+    : /oppo|realme|oneplus|vivo|iqoo/.test(brand)
+      ? 'Oppo/Realme/Vivo: App info → Battery → <b>Allow background activity</b> and <b>Allow auto launch</b>; Permissions → <b>Display over other apps</b>.'
+      : /samsung/.test(brand) ? 'Samsung: Settings → Battery → Background usage limits → make sure Gatekeeper is <b>not</b> in Sleeping apps.' : '';
+  return `<div class="card" style="margin-bottom:14px">
+    <b>📱 Full-screen alerts on this phone</b>
+    <div style="margin-top:8px">${NATIVE_STEPS.map(([k, label, setting]) => `<div class="row" style="padding:6px 0;border-bottom:1px solid var(--line)">
+      <span class="grow">${st[k] ? '✅' : '❌'} ${label}</span>
+      ${st[k] ? '' : setting ? `<button class="btn primary sm" data-action="native-fix" data-name="${setting}">Fix</button>` : '<button class="btn primary sm" data-action="native-retry">Retry</button>'}
+    </div>`).join('')}</div>
+    ${st.error ? `<p class="small" style="color:var(--red)">⚠️ ${esc(st.error)}</p>` : ''}
+    ${oemTip ? `<p class="muted small">${oemTip} <button class="btn sm" data-action="native-fix" data-name="appinfo">Open app info</button></p>` : ''}
+    <div class="row" style="margin-top:10px">
+      <button class="btn" data-action="test-push">📨 Send test alert</button>
+      <button class="btn" data-action="render">🔄 Re-check</button>
+    </div>
+    <p class="muted small" style="margin-bottom:0">Tap <b>Send test alert</b>, then lock the phone straight away – the full-screen alert should appear within a few seconds. App version ${esc(Native.version())}</p>
+  </div>`;
+}
 function accountHTML() {
+  if (Native) {
+    return `<h2>My account</h2>
+    <div class="card" style="margin-bottom:14px">
+      <dl class="kv"><dt>Name</dt><dd>${esc(S.user.name)}</dd><dt>Username</dt><dd>${esc(S.user.username)}</dd>
+      <dt>Role</dt><dd>${isAdmin() ? 'Admin' : 'Gate guard'}</dd><dt>Unit</dt><dd>${esc(S.user.unit_name || 'All units')}</dd></dl>
+    </div>
+    ${nativeAlertsHTML()}
+    ${pwFormHTML()}`;
+  }
   return `<h2>My account</h2>
   <div class="card" style="margin-bottom:14px">
     <dl class="kv"><dt>Name</dt><dd>${esc(S.user.name)}</dd><dt>Username</dt><dd>${esc(S.user.username)}</dd>
@@ -745,7 +809,14 @@ function accountHTML() {
     </div>
     <p class="muted small" style="margin-bottom:0">Not popping up on screen? See the phone settings steps from your admin (Android: Notifications → "Pop on screen"; battery → Unrestricted).</p>
   </div>
-  <form id="pw-form" class="card">
+  <div class="card" style="margin-bottom:14px">
+    <b>📱 Android phone?</b> Install the Gatekeeper app for <b>full-screen alerts</b> that pop up in front of everything, even on the lock screen.
+    <div style="margin-top:10px"><a class="btn primary" href="/app" style="text-decoration:none;display:inline-block">⬇ Download Android app</a></div>
+  </div>
+  ${pwFormHTML()}`;
+}
+function pwFormHTML() {
+  return `<form id="pw-form" class="card">
     <b>Change password</b>
     <label>Current password</label><input type="password" name="current" required autocomplete="current-password">
     <label>New password (min 6)</label><input type="password" name="next" required minlength="6" autocomplete="new-password">
@@ -779,6 +850,9 @@ document.addEventListener('click', async (ev) => {
     case 'clear-photo': S.draft.photo = null; render(); break;
     case 'enable-push': enablePush(); break;
     case 'test-push': testPush(el); break;
+    case 'native-fix': Native?.openSetting(el.dataset.name); break;
+    case 'native-retry': Native?.retryRegister(); setTimeout(render, 2500); break;
+    case 'render': render(); break;
     case 'dismiss-push': localStorage.setItem('gk_push_dismiss', '1'); render(); break;
     case 'csv': downloadCSV(); break;
     case 'edit-unit': {

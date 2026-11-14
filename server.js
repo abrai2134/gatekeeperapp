@@ -12,6 +12,7 @@ const express = require('express');
 const { Server } = require('socket.io');
 const webpush = require('web-push');
 const { DatabaseSync } = require('node:sqlite');
+const createFcm = require('./fcm');
 
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -81,6 +82,11 @@ CREATE TABLE IF NOT EXISTS push_subs (
   data TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS fcm_tokens (
+  token TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
 `);
 // upgrades for databases created by older versions
 for (const [col, def] of [['reminder_count', 'INTEGER NOT NULL DEFAULT 0'], ['last_reminded_at', 'TEXT']]) {
@@ -127,25 +133,51 @@ webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'mailto:admin@example.com',
 
 // Send a push to every phone/browser of these users. Temporary failures are retried;
 // dead subscriptions (phone uninstalled app / blocked notifications) are removed.
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 function sendPush(sub, payload, attempt = 1) {
-  return webpush.sendNotification(JSON.parse(sub.data), JSON.stringify(payload), { TTL: 6 * 3600, urgency: 'high' })
+  const { entry: _omit, ...small } = payload; // web push has a ~4KB limit – details are fetched by the app
+  return webpush.sendNotification(JSON.parse(sub.data), JSON.stringify(small), { TTL: 6 * 3600, urgency: 'high' })
     .then(() => true)
     .catch((err) => {
       if (err.statusCode === 404 || err.statusCode === 410) {
         db.prepare('DELETE FROM push_subs WHERE endpoint = ?').run(sub.endpoint);
         return false;
       }
-      if (attempt < 3) return new Promise((r) => setTimeout(r, attempt * 5000)).then(() => sendPush(sub, payload, attempt + 1));
+      if (attempt < 3) return wait(attempt * 5000).then(() => sendPush(sub, payload, attempt + 1));
       console.error('push failed', err.statusCode || '', err.body || err.message);
       return false;
     });
 }
-function pushToUsers(userIds, payload) {
+// ---- Android app alerts (Firebase Cloud Messaging)
+const fcm = createFcm({ dataDir: DATA_DIR, androidPackage: process.env.ANDROID_PACKAGE || 'com.wellworth.gatekeeper' });
+console.log(`Android app alerts (Firebase): ${fcm.enabled ? 'ON' : 'not set up yet'}${fcm.clientConfig ? '' : ' – google-services.json missing'}`);
+function sendFcm(token, data, attempt = 1) {
+  if (!fcm.enabled) return Promise.resolve(false);
+  return fcm.send(token, data)
+    .then((r) => {
+      if (r === 'invalid') { db.prepare('DELETE FROM fcm_tokens WHERE token = ?').run(token); return false; }
+      return true;
+    })
+    .catch((err) => {
+      const retry = !err.status || err.status >= 500 || err.status === 429 || err.status === 401;
+      if (retry && attempt < 3) return wait(attempt * 5000).then(() => sendFcm(token, data, attempt + 1));
+      console.error('android push failed', err.message);
+      return false;
+    });
+}
+
+// Notify users on all their devices: browsers/PWA (web push) and the Android app (FCM).
+function pushToUsers(userIds, payload, { web = true } = {}) {
   if (!userIds.length) return Promise.resolve([]);
-  const subs = db.prepare(
-    `SELECT endpoint, data FROM push_subs WHERE user_id IN (${userIds.map(() => '?').join(',')})`
-  ).all(...userIds);
-  return Promise.all(subs.map((s) => sendPush(s, payload)));
+  const ph = userIds.map(() => '?').join(',');
+  const jobs = [];
+  if (web) {
+    for (const s of db.prepare(`SELECT endpoint, data FROM push_subs WHERE user_id IN (${ph})`).all(...userIds)) jobs.push(sendPush(s, payload));
+  }
+  const data = Object.fromEntries(Object.entries(payload).filter(([, v]) => v != null)
+    .map(([k, v]) => [k, typeof v === 'string' ? v : JSON.stringify(v)]));
+  for (const t of db.prepare(`SELECT token FROM fcm_tokens WHERE user_id IN (${ph})`).all(...userIds)) jobs.push(sendFcm(t.token, data));
+  return Promise.all(jobs);
 }
 // admins who can see a unit: global admins + admins of that unit
 const adminIdsForUnit = (unitId) =>
@@ -240,11 +272,35 @@ app.post('/api/push/resubscribe', (req, res) => {
 });
 app.get('/api/push/key', (req, res) => res.type('text').send(vapid.publicKey));
 app.get('/api/push/status', auth, (req, res) => {
-  res.json({ devices: db.prepare('SELECT COUNT(*) c FROM push_subs WHERE user_id = ?').get(req.user.id).c });
+  const web = db.prepare('SELECT COUNT(*) c FROM push_subs WHERE user_id = ?').get(req.user.id).c;
+  const android = db.prepare('SELECT COUNT(*) c FROM fcm_tokens WHERE user_id = ?').get(req.user.id).c;
+  res.json({ devices: web + android, web, android, androidEnabled: fcm.enabled });
 });
+// Android app: register / remove this phone for alerts
+app.post('/api/push/fcm', auth, (req, res) => {
+  const token = clean(req.body?.token, 4096);
+  if (!token) return res.status(400).json({ error: 'Missing token' });
+  db.prepare(`INSERT INTO fcm_tokens(token, user_id) VALUES (?, ?)
+              ON CONFLICT(token) DO UPDATE SET user_id = excluded.user_id, created_at = excluded.created_at`)
+    .run(token, req.user.id);
+  res.json({ ok: true, enabled: fcm.enabled });
+});
+app.post('/api/push/fcm/remove', auth, (req, res) => {
+  if (req.body?.token) db.prepare('DELETE FROM fcm_tokens WHERE token = ?').run(String(req.body.token));
+  res.json({ ok: true });
+});
+// Android app reads its Firebase settings from here, so the APK works with whatever Firebase project the server uses
+app.get('/api/android/config', (req, res) => {
+  if (!fcm.clientConfig) return res.status(404).json({ error: 'Android alerts are not set up on the server yet (google-services.json missing)' });
+  res.json(fcm.clientConfig);
+});
+// short link to download the latest Android app
+app.get('/app', (req, res) => res.redirect(process.env.ANDROID_APK_URL || 'https://github.com/abrai2134/gatekeeperapp/releases/latest/download/gatekeeper.apk'));
 app.post('/api/push/test', auth, async (req, res) => {
+  const delay = Math.min(10, Math.max(0, Number(req.body?.delay) || 0));
+  if (delay) await wait(delay * 1000); // gives time to lock the phone before the test arrives
   const results = await pushToUsers([req.user.id], {
-    title: '🔔 Test notification', body: `Notifications are working for ${req.user.name} ✔`, tag: 'test', kind: 'request',
+    title: '🔔 Test notification', body: `Notifications are working for ${req.user.name} ✔`, tag: 'test', kind: 'test',
   });
   res.json({ devices: results.length, delivered: results.filter(Boolean).length });
 });
@@ -360,7 +416,7 @@ app.post('/api/entries', auth, (req, res) => {
     title: `🔔 Entry request – ${entry.unit_name}`,
     body: `${type === 'PERSON' ? '👤' : '📦'} ${entry.visitor_name}${entry.company ? ' (' + entry.company + ')' : ''}` +
       `${entry.purpose ? ' – ' + entry.purpose : ''}${entry.material_desc ? ' – ' + entry.material_desc : ''}\nTap to approve or reject`,
-    tag: `entry-${entry.id}`, entryId: entry.id, kind: 'request',
+    tag: `entry-${entry.id}`, entryId: entry.id, kind: 'request', entry,
   });
   res.json(entry);
 });
@@ -413,8 +469,10 @@ app.post('/api/entries/:id/decision', auth, requireRole('admin'), (req, res) => 
   pushToUsers(guardIdsForUnit(updated.unit_id), {
     title: ok ? `✅ APPROVED – allow entry` : `❌ REJECTED – do not allow`,
     body: `${updated.visitor_name}${updated.admin_remark ? '\nRemark: ' + updated.admin_remark : ''}\nBy ${req.user.name}`,
-    tag: `entry-${updated.id}`, entryId: updated.id, kind: ok ? 'approved' : 'rejected',
+    tag: `entry-${updated.id}`, entryId: updated.id, kind: ok ? 'approved' : 'rejected', entry: updated,
   });
+  // close the alert on other admins' Android phones
+  pushToUsers(adminIdsForUnit(updated.unit_id), { kind: 'closed', entryId: updated.id, by: req.user.name, status: decision }, { web: false });
   res.json(updated);
 });
 
@@ -468,7 +526,7 @@ function sendReminders() {
     pushToUsers(adminIdsForUnit(e.unit_id), {
       title: `⏰ Still waiting ${mins} min – ${e.unit_name}`,
       body: `${e.entry_type === 'PERSON' ? '👤' : '📦'} ${e.visitor_name} is waiting at the gate. Tap to approve or reject`,
-      tag: `entry-${e.id}`, entryId: e.id, kind: 'request',
+      tag: `entry-${e.id}`, entryId: e.id, kind: 'request', entry: e,
     });
     io.to(`unit:${e.unit_id}`).to('admins:all').emit('entry:reminder', e);
   }

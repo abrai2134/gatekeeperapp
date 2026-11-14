@@ -1,14 +1,53 @@
 'use strict';
-// End-to-end smoke test: run with `npm test` (uses a throw-away database)
+// End-to-end smoke test: run with `npm test` (uses a throw-away database and a fake Firebase server)
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
+const crypto = require('crypto');
 const assert = require('assert');
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'gk-test-'));
+
+// ---- fake Google OAuth + FCM server
+const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+const fcmSent = [];
+const mock = http.createServer((req, res) => {
+  let body = '';
+  req.on('data', (c) => { body += c; });
+  req.on('end', () => {
+    if (req.url === '/token') {
+      const jwt = new URLSearchParams(body).get('assertion').split('.');
+      const ok = crypto.verify('RSA-SHA256', Buffer.from(`${jwt[0]}.${jwt[1]}`), publicKey, Buffer.from(jwt[2], 'base64url'));
+      res.writeHead(ok ? 200 : 401, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(ok ? { access_token: 'AT', expires_in: 3600 } : { error: 'bad sig' }));
+    }
+    const msg = JSON.parse(body).message;
+    if (req.headers.authorization !== 'Bearer AT') { res.writeHead(401); return res.end('{}'); }
+    if (msg.token === 'dead-token') { res.writeHead(404); return res.end('{"error":{"status":"NOT_FOUND","details":[{"errorCode":"UNREGISTERED"}]}}'); }
+    fcmSent.push(msg);
+    res.writeHead(200); res.end('{"name":"x"}');
+  });
+});
+
+let base;
+mock.listen(0, () => {
+  const mp = mock.address().port;
+  process.env.FCM_API_BASE = `http://127.0.0.1:${mp}`;
+  process.env.FIREBASE_SERVICE_ACCOUNT = JSON.stringify({
+    project_id: 'demo', client_email: 'x@demo.iam.gserviceaccount.com', token_uri: `http://127.0.0.1:${mp}/token`,
+    private_key: privateKey.export({ type: 'pkcs8', format: 'pem' }),
+  });
+  process.env.GOOGLE_SERVICES_JSON = JSON.stringify({
+    project_info: { project_number: '123', project_id: 'demo' },
+    client: [{ client_info: { mobilesdk_app_id: '1:123:android:abc', android_client_info: { package_name: 'com.wellworth.gatekeeper' } }, api_key: [{ current_key: 'KEY' }] }],
+  });
+  run();
+});
+
+function run() {
 const { server, db, sendReminders } = require('../server');
 const { io } = require('socket.io-client');
 
-let base;
 const call = async (token, method, url, body) => {
   const r = await fetch(base + url, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) }, body: body ? JSON.stringify(body) : undefined });
   return { status: r.status, data: await r.json().catch(() => null) };
@@ -85,16 +124,37 @@ server.listen(0, async () => {
     await call(admin, 'POST', `/api/entries/${late.id}/decision`, { decision: 'REJECTED' });
 
     // push helpers
-    assert.deepEqual((await call(admin, 'GET', '/api/push/status')).data, { devices: 0 });
+    assert.equal((await call(admin, 'GET', '/api/push/status')).data.devices, 0);
     assert.deepEqual((await call(admin, 'POST', '/api/push/test', {})).data, { devices: 0, delivered: 0 });
     assert.equal((await call(null, 'POST', '/api/push/resubscribe', { oldEndpoint: 'x', subscription: { endpoint: 'y' } })).status, 404);
 
+    // ---- Android app (FCM) alerts
+    assert.deepEqual((await call(null, 'GET', '/api/android/config')).data, { appId: '1:123:android:abc', apiKey: 'KEY', projectId: 'demo', senderId: '123' });
+    await call(admin, 'POST', '/api/push/fcm', { token: 'admin-phone' });
+    await call(admin, 'POST', '/api/push/fcm', { token: 'dead-token' });
+    await call(g1, 'POST', '/api/push/fcm', { token: 'guard-phone' });
+    const fe = (await call(g1, 'POST', '/api/entries', { entry_type: 'PERSON', visitor_name: 'Android test' })).data;
+    await new Promise((r) => setTimeout(r, 300));
+    const toAdmin = fcmSent.find((m) => m.token === 'admin-phone' && m.data.kind === 'request');
+    assert.ok(toAdmin, 'admin phone got FCM request');
+    assert.equal(toAdmin.android.priority, 'HIGH');
+    assert.equal(JSON.parse(toAdmin.data.entry).visitor_name, 'Android test');
+    assert.equal(db.prepare("SELECT COUNT(*) c FROM fcm_tokens WHERE token='dead-token'").get().c, 0, 'dead token removed');
+    await call(admin, 'POST', `/api/entries/${fe.id}/decision`, { decision: 'APPROVED' });
+    await new Promise((r) => setTimeout(r, 300));
+    assert.ok(fcmSent.find((m) => m.token === 'guard-phone' && m.data.kind === 'approved' && m.data.entryId === String(fe.id)), 'guard phone got approval');
+    assert.ok(fcmSent.find((m) => m.token === 'admin-phone' && m.data.kind === 'closed'), 'admin alert closed');
+    assert.deepEqual((await call(g1, 'POST', '/api/push/test', {})).data, { devices: 1, delivered: 1 });
+    await call(g1, 'POST', '/api/push/fcm/remove', { token: 'guard-phone' });
+    assert.equal((await call(g1, 'GET', '/api/push/status')).data.android, 0);
+
     const stats = (await call(admin, 'GET', '/api/stats')).data;
-    assert.deepEqual([stats.pending, stats.inside, stats.today, stats.rejected], [0, 0, 3, 2]);
+    assert.deepEqual([stats.pending, stats.inside, stats.today, stats.rejected], [0, 1, 4, 2]);
     console.log('✔ all smoke tests passed');
   } catch (e) {
     console.error('✖', e); process.exitCode = 1;
   } finally {
-    sockets.forEach((s) => s.close()); server.close(); setTimeout(() => process.exit(), 100);
+    sockets.forEach((s) => s.close()); server.close(); mock.close(); setTimeout(() => process.exit(), 100);
   }
 });
+}
