@@ -107,9 +107,25 @@ const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in win
 async function checkPush() {
   if (!pushSupported()) return;
   const reg = await navigator.serviceWorker.ready;
-  const sub = await reg.pushManager.getSubscription();
+  let sub = await reg.pushManager.getSubscription();
+  if (Notification.permission === 'granted' && !sub && S.vapidKey) {
+    // permission was given before but the subscription was lost (browser cleanup / update): renew silently
+    try { sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToUint8(S.vapidKey) }); } catch { /* ignore */ }
+  }
   S.pushOn = !!sub && Notification.permission === 'granted';
-  if (sub && S.pushOn) api('/api/push/subscribe', { body: sub.toJSON() }).catch(() => {}); // re-link to current user
+  if (sub && S.pushOn) await api('/api/push/subscribe', { body: sub.toJSON() }).catch(() => {}); // re-link to current user
+  try { S.pushDevices = (await api('/api/push/status')).devices; } catch { /* ignore */ }
+}
+async function testPush(btn) {
+  btn && (btn.disabled = true);
+  try {
+    if (!S.pushOn) await enablePush();
+    const r = await api('/api/push/test', { body: {} });
+    if (!r.devices) toast('No phone/browser is registered for your login. Tap Enable first.', 'err');
+    else if (!r.delivered) toast('Sending failed. Tap Enable again, then retry.', 'err');
+    else toast(`Test sent to ${r.delivered} device(s). Lock the phone – it should pop up within seconds.`, 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+  btn && (btn.disabled = false);
 }
 async function enablePush() {
   if (!pushSupported()) { toast('This browser does not support notifications. On iPhone, add the app to Home Screen first.', 'err'); return; }
@@ -121,6 +137,7 @@ async function enablePush() {
     if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToUint8(S.vapidKey) });
     await api('/api/push/subscribe', { body: sub.toJSON() });
     S.pushOn = true;
+    try { S.pushDevices = (await api('/api/push/status')).devices; } catch { /* ignore */ }
     toast('Notifications enabled ✔', 'ok');
   } catch (e) {
     console.error(e);
@@ -184,12 +201,54 @@ function connectSocket() {
   S.socket?.disconnect();
   const sock = io({ auth: { token: S.token } });
   S.socket = sock;
-  sock.on('connect', async () => { S.connected = true; try { await refreshLive(); } catch { /* ignore */ } render(); });
+  sock.on('connect', () => { S.connected = true; catchUp(); });
   sock.on('disconnect', () => { S.connected = false; render(); });
   sock.on('connect_error', (err) => { S.connected = false; if (err.message === 'unauthorized') logout(true); render(); });
   sock.on('entry:new', onEntryNew);
   sock.on('entry:updated', onEntryUpdated);
+  sock.on('entry:reminder', (e) => {
+    if (!isAdmin()) return;
+    S.entries[e.id] = e;
+    snoozed.delete(e.id);
+    beep(SOUND.request); vibrate([300, 100, 300]);
+    if (!S.decisionQueue.includes(e.id)) S.decisionQueue.push(e.id);
+    showNextDecision();
+    render();
+  });
 }
+
+// When the phone wakes up / app comes back to the screen / internet returns, the live connection may have
+// been asleep. Reload and pop up anything that happened meanwhile so nothing is missed.
+let catchingUp = false;
+const snoozed = new Set(); // requests the admin chose to "decide later"
+async function catchUp() {
+  if (!S.user || catchingUp) return;
+  catchingUp = true;
+  try {
+    const before = Object.fromEntries(Object.values(S.entries).map((e) => [e.id, e.status]));
+    await refreshLive();
+    if (isAdmin()) {
+      const fresh = liveList('PENDING').filter((e) => !S.decisionQueue.includes(e.id) && !snoozed.has(e.id)).reverse();
+      if (fresh.some((e) => before[e.id] !== 'PENDING')) { beep(SOUND.request); vibrate([300, 100, 300]); }
+      fresh.forEach((e) => S.decisionQueue.push(e.id));
+      showNextDecision();
+    } else {
+      const decided = Object.values(S.entries)
+        .filter((e) => before[e.id] === 'PENDING' && (e.status === 'APPROVED' || e.status === 'REJECTED'))
+        .sort((a, b) => a.decided_at.localeCompare(b.decided_at));
+      const last = decided[decided.length - 1];
+      if (last && !(currentModal?.type === 'decision')) {
+        beep(last.status === 'APPROVED' ? SOUND.approved : SOUND.rejected);
+        showResult(last);
+        if (decided.length > 1) toast(`${decided.length} requests were answered – see Inside / Last 24h`);
+      }
+    }
+  } catch { /* offline – try again later */ } finally { catchingUp = false; }
+  render();
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { catchUp(); checkPush().then(render); } });
+window.addEventListener('online', catchUp);
+setInterval(() => { if (!document.hidden) catchUp(); }, 60000);
 async function refreshStats() {
   try { S.stats = await api(`/api/stats?since=${encodeURIComponent(dayStart().toISOString())}`); } catch { /* ignore */ }
 }
@@ -679,7 +738,12 @@ function accountHTML() {
   <div class="card" style="margin-bottom:14px">
     <dl class="kv"><dt>Name</dt><dd>${esc(S.user.name)}</dd><dt>Username</dt><dd>${esc(S.user.username)}</dd>
     <dt>Role</dt><dd>${isAdmin() ? 'Admin' : 'Gate guard'}</dd><dt>Unit</dt><dd>${esc(S.user.unit_name || 'All units')}</dd>
-    <dt>Notifications</dt><dd>${S.pushOn ? '✅ On' : '❌ Off'} <button class="btn sm" data-action="enable-push">${S.pushOn ? 'Re-check' : 'Enable'}</button></dd></dl>
+    <dt>Notifications</dt><dd>${S.pushOn ? '✅ On for this phone' : '❌ Off on this phone'}${S.pushDevices != null ? ` · ${S.pushDevices} device(s) registered` : ''}</dd></dl>
+    <div class="row">
+      <button class="btn primary" data-action="enable-push">${S.pushOn ? '🔄 Re-enable' : '🔔 Enable notifications'}</button>
+      <button class="btn" data-action="test-push">📨 Send test notification</button>
+    </div>
+    <p class="muted small" style="margin-bottom:0">Not popping up on screen? See the phone settings steps from your admin (Android: Notifications → "Pop on screen"; battery → Unrestricted).</p>
   </div>
   <form id="pw-form" class="card">
     <b>Change password</b>
@@ -702,7 +766,7 @@ document.addEventListener('click', async (ev) => {
     case 'logout': if (confirm('Log out?')) logout(); break;
     case 'open': if (!ev.target.closest('button')) openEntry(id); break;
     case 'close': closeModal(); if (isAdmin()) showNextDecision(); break;
-    case 'later': S.decisionQueue = S.decisionQueue.filter((x) => x !== currentModal?.id); closeModal(); showNextDecision(); break;
+    case 'later': snoozed.add(currentModal?.id); S.decisionQueue = S.decisionQueue.filter((x) => x !== currentModal?.id); closeModal(); showNextDecision(); break;
     case 'decide': decide(id, el.dataset.decision, el); break;
     case 'quick-decide': {
       const e = S.entries[id];
@@ -714,6 +778,7 @@ document.addEventListener('click', async (ev) => {
     case 'etype': { const keep = captureForm(); S.draft.entry_type = el.dataset.type; render(); if (keep) restoreForm(keep); break; }
     case 'clear-photo': S.draft.photo = null; render(); break;
     case 'enable-push': enablePush(); break;
+    case 'test-push': testPush(el); break;
     case 'dismiss-push': localStorage.setItem('gk_push_dismiss', '1'); render(); break;
     case 'csv': downloadCSV(); break;
     case 'edit-unit': {

@@ -82,6 +82,10 @@ CREATE TABLE IF NOT EXISTS push_subs (
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 `);
+// upgrades for databases created by older versions
+for (const [col, def] of [['reminder_count', 'INTEGER NOT NULL DEFAULT 0'], ['last_reminded_at', 'TEXT']]) {
+  if (!db.prepare('PRAGMA table_info(entries)').all().some((c) => c.name === col)) db.exec(`ALTER TABLE entries ADD COLUMN ${col} ${def}`);
+}
 
 // ---------------------------------------------------------------- helpers
 const now = () => new Date().toISOString();
@@ -121,19 +125,27 @@ if (!vapid) {
 vapid = JSON.parse(vapid);
 webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'mailto:admin@example.com', vapid.publicKey, vapid.privateKey);
 
+// Send a push to every phone/browser of these users. Temporary failures are retried;
+// dead subscriptions (phone uninstalled app / blocked notifications) are removed.
+function sendPush(sub, payload, attempt = 1) {
+  return webpush.sendNotification(JSON.parse(sub.data), JSON.stringify(payload), { TTL: 6 * 3600, urgency: 'high' })
+    .then(() => true)
+    .catch((err) => {
+      if (err.statusCode === 404 || err.statusCode === 410) {
+        db.prepare('DELETE FROM push_subs WHERE endpoint = ?').run(sub.endpoint);
+        return false;
+      }
+      if (attempt < 3) return new Promise((r) => setTimeout(r, attempt * 5000)).then(() => sendPush(sub, payload, attempt + 1));
+      console.error('push failed', err.statusCode || '', err.body || err.message);
+      return false;
+    });
+}
 function pushToUsers(userIds, payload) {
-  if (!userIds.length) return;
+  if (!userIds.length) return Promise.resolve([]);
   const subs = db.prepare(
     `SELECT endpoint, data FROM push_subs WHERE user_id IN (${userIds.map(() => '?').join(',')})`
   ).all(...userIds);
-  for (const s of subs) {
-    webpush.sendNotification(JSON.parse(s.data), JSON.stringify(payload), { TTL: 3600, urgency: 'high' })
-      .catch((err) => {
-        if (err.statusCode === 404 || err.statusCode === 410) {
-          db.prepare('DELETE FROM push_subs WHERE endpoint = ?').run(s.endpoint);
-        }
-      });
-  }
+  return Promise.all(subs.map((s) => sendPush(s, payload)));
 }
 // admins who can see a unit: global admins + admins of that unit
 const adminIdsForUnit = (unitId) =>
@@ -214,6 +226,27 @@ app.post('/api/push/subscribe', auth, (req, res) => {
               ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id, data=excluded.data`)
     .run(sub.endpoint, req.user.id, JSON.stringify(sub));
   res.json({ ok: true });
+});
+// called by the service worker when the browser renews a subscription (no login token there)
+app.post('/api/push/resubscribe', (req, res) => {
+  const { oldEndpoint, subscription } = req.body || {};
+  const old = oldEndpoint && db.prepare('SELECT user_id FROM push_subs WHERE endpoint = ?').get(oldEndpoint);
+  if (!old || !subscription?.endpoint) return res.status(404).json({ error: 'Unknown subscription' });
+  db.prepare('DELETE FROM push_subs WHERE endpoint = ?').run(oldEndpoint);
+  db.prepare(`INSERT INTO push_subs(endpoint,user_id,data) VALUES (?,?,?)
+              ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id, data=excluded.data`)
+    .run(subscription.endpoint, old.user_id, JSON.stringify(subscription));
+  res.json({ ok: true });
+});
+app.get('/api/push/key', (req, res) => res.type('text').send(vapid.publicKey));
+app.get('/api/push/status', auth, (req, res) => {
+  res.json({ devices: db.prepare('SELECT COUNT(*) c FROM push_subs WHERE user_id = ?').get(req.user.id).c });
+});
+app.post('/api/push/test', auth, async (req, res) => {
+  const results = await pushToUsers([req.user.id], {
+    title: '🔔 Test notification', body: `Notifications are working for ${req.user.name} ✔`, tag: 'test', kind: 'request',
+  });
+  res.json({ devices: results.length, delivered: results.filter(Boolean).length });
 });
 app.post('/api/push/unsubscribe', auth, (req, res) => {
   if (req.body?.endpoint) db.prepare('DELETE FROM push_subs WHERE endpoint = ?').run(req.body.endpoint);
@@ -420,6 +453,28 @@ app.use((err, req, res, _next) => {
   res.status(500).json({ error: 'Server error' });
 });
 
+// ---------------------------------------------------------------- reminders
+// If a request is still waiting, remind the admins again every REMIND_EVERY_MIN minutes (max REMIND_MAX times)
+const REMIND_EVERY_MIN = Number(process.env.REMIND_EVERY_MIN || 2);
+const REMIND_MAX = Number(process.env.REMIND_MAX || 5);
+function sendReminders() {
+  const cutoff = new Date(Date.now() - REMIND_EVERY_MIN * 60000).toISOString();
+  const due = db.prepare(`SELECT id FROM entries WHERE status='PENDING' AND reminder_count < ?
+                          AND COALESCE(last_reminded_at, requested_at) <= ?`).all(REMIND_MAX, cutoff);
+  for (const { id } of due) {
+    db.prepare('UPDATE entries SET reminder_count = reminder_count + 1, last_reminded_at = ? WHERE id = ?').run(now(), id);
+    const e = getEntry(id);
+    const mins = Math.round((Date.now() - new Date(e.requested_at)) / 60000);
+    pushToUsers(adminIdsForUnit(e.unit_id), {
+      title: `⏰ Still waiting ${mins} min – ${e.unit_name}`,
+      body: `${e.entry_type === 'PERSON' ? '👤' : '📦'} ${e.visitor_name} is waiting at the gate. Tap to approve or reject`,
+      tag: `entry-${e.id}`, entryId: e.id, kind: 'request',
+    });
+    io.to(`unit:${e.unit_id}`).to('admins:all').emit('entry:reminder', e);
+  }
+}
+if (REMIND_MAX > 0) setInterval(() => { try { sendReminders(); } catch (err) { console.error(err); } }, 30000).unref();
+
 // ---------------------------------------------------------------- realtime
 const server = http.createServer(app);
 const io = new Server(server);
@@ -439,4 +494,4 @@ io.on('connection', (socket) => {
 if (require.main === module) {
   server.listen(PORT, () => console.log(`Gatekeeper running on http://localhost:${PORT}`));
 }
-module.exports = { server, db };
+module.exports = { server, db, sendReminders };

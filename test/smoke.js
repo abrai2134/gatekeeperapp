@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const assert = require('assert');
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'gk-test-'));
-const { server } = require('../server');
+const { server, db, sendReminders } = require('../server');
 const { io } = require('socket.io-client');
 
 let base;
@@ -74,8 +74,23 @@ server.listen(0, async () => {
     await new Promise((r) => setTimeout(r, 100));
     assert.equal(g2Got, false, 'guard2 must not get unit-1 events'); assert.equal(a2Got, true);
 
+    // reminder for a request still waiting
+    const late = (await call(g1, 'POST', '/api/entries', { entry_type: 'PERSON', visitor_name: 'Late visitor' })).data;
+    db.prepare('UPDATE entries SET requested_at = ? WHERE id = ?').run(new Date(Date.now() - 10 * 60000).toISOString(), late.id);
+    const pRem = waitFor(sAdmin, 'entry:reminder');
+    sendReminders();
+    assert.equal((await pRem).id, late.id);
+    sendReminders(); // not due again yet
+    assert.equal(db.prepare('SELECT reminder_count c FROM entries WHERE id = ?').get(late.id).c, 1);
+    await call(admin, 'POST', `/api/entries/${late.id}/decision`, { decision: 'REJECTED' });
+
+    // push helpers
+    assert.deepEqual((await call(admin, 'GET', '/api/push/status')).data, { devices: 0 });
+    assert.deepEqual((await call(admin, 'POST', '/api/push/test', {})).data, { devices: 0, delivered: 0 });
+    assert.equal((await call(null, 'POST', '/api/push/resubscribe', { oldEndpoint: 'x', subscription: { endpoint: 'y' } })).status, 404);
+
     const stats = (await call(admin, 'GET', '/api/stats')).data;
-    assert.deepEqual([stats.pending, stats.inside, stats.today, stats.rejected], [0, 0, 2, 1]);
+    assert.deepEqual([stats.pending, stats.inside, stats.today, stats.rejected], [0, 0, 3, 2]);
     console.log('✔ all smoke tests passed');
   } catch (e) {
     console.error('✖', e); process.exitCode = 1;
