@@ -46,6 +46,42 @@ Data is stored in `data/gatekeeper.db`. Back up this file. You can change the fo
 - On iPhone, push works only after the app is added to the Home Screen (iOS 16.4+).
 - Optional: set `VAPID_SUBJECT=mailto:you@yourcompany.com` for the push service contact.
 
+## Android app (full-screen alerts like an incoming call)
+
+The `android/` folder has an Android app that opens the same Gatekeeper site. When a request arrives, it also shows a **full-screen alert in front of everything, even on the lock screen**:
+- **Admin:** visitor details with big green **APPROVE** and red **REJECT** buttons, ringing until someone handles it.
+- **Guard:** a full green **APPROVED** or red **REJECTED** screen.
+
+The web app and the Android app work together with the same logins and data.
+
+### One-time setup
+1. **Firebase (free):**
+   1. At https://console.firebase.google.com create a project.
+   2. Add an **Android app** with package name `com.wellworth.gatekeeper`, then download **google-services.json**.
+   3. Open **Project settings → Service accounts → Generate new private key**. This downloads a JSON file.
+2. **Render:** open your service, then **Environment → Secret Files**, and add two files:
+   - filename `google-services.json` → paste that file's contents
+   - filename `firebase-service-account.json` → paste the private key file's contents
+
+   Save; Render redeploys. The log should then show `Android app alerts (Firebase): ON`.
+3. **GitHub (signing key):** in the repo, open **Settings → Secrets and variables → Actions → New repository secret**.
+   - Name: `ANDROID_KEYSTORE_B64`
+   - Value: the signing key text you were given.
+
+   This lets phones install updates without uninstalling first.
+4. **Build:** every push that changes `android/` builds the app automatically (**Actions** tab).
+
+   Download link for phones: `https://<your-server>/app`, or https://github.com/abrai2134/gatekeeperapp/releases/latest/download/gatekeeper.apk
+
+### On each Android phone
+1. Open the download link, install `gatekeeper.apk`, and allow **Install unknown apps** when asked.
+2. Open **Gatekeeper**, log in, and allow notifications.
+3. Go to **Account → Full-screen alerts on this phone** and tap **Fix** on every ❌ until all are ✅:
+   - Full-screen alerts
+   - Display over other apps
+   - Battery not optimised
+4. Tap **Send test alert** and lock the phone. A full-screen alert should appear within about 5 seconds.
+
 ## Test
 
 ```bash
